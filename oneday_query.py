@@ -92,6 +92,9 @@ def fetch_recent_from_nvd(days, limit, verbose):
         if not vulns:
             break
 
+        # Sort in reverse-order to get newest ones to appear at the top
+        vulns.sort(key=lambda v: v["cve"]["published"], reverse=True)
+
         results.extend(vulns)
         if len(vulns) < page_size:
             break
@@ -262,6 +265,19 @@ def parse_cpe(criteria):
         "version": parts[5] if len(parts) > 5 else "*",
     }
 
+def push_results_to_oneday(results):
+    payload = {
+        "source": "oneday_query_runner",
+        "sent_at": dt.datetime.utcnow().isoformat() + "Z",
+        "vulnerabilities": results,
+    }
+    r = requests.post(
+        "https://oneday.darkage.io/vulns",
+        json=payload,
+        timeout=10,
+    )
+    r.raise_for_status()
+
 def format_table(rows):
     if not rows:
         return "No results."
@@ -371,6 +387,10 @@ def main():
     if not results:
         print("No results after CVSS filtering and NVD enrichment (min-cvss = {}).".format(args.min_cvss))
         sys.exit(0)
+
+    print("[*] Pushing results to oneday cloud...")
+    push_results_to_oneday(results)
+    print("[+] Success")
 
     print(format_table(results))
     if not args.no_save:
