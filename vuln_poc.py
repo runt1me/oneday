@@ -28,8 +28,10 @@ def parse_args():
     p.add_argument("--limit", type=int, default=100, help="Max CVEs to return before enrichment (default: 100).")
     p.add_argument("--days", type=int, default=7, help="Recent days window when vendor/product not provided (default: 7).")
     p.add_argument("--sleep", type=float, default=0.8, help="Seconds to sleep between NVD requests (respect rate limits).")
+    p.add_argument("--tech", help="Filter by vendor/product/CPE keyword (e.g. coldfusion, apache, windows).")
     p.add_argument("--no-save", action="store_true", help="Do not write cves.csv output.")
     p.add_argument("--verbose", action="store_true", help="Verbose logging.")
+    p.add_argument("--min-year", type=int, help="Minimum CVE year (e.g., 2023).")
     return p.parse_args()
 
 def log(msg, verbose):
@@ -183,24 +185,82 @@ def nvd_extract_metrics(nvd_item):
     return (None, None, None)
 
 def nvd_extract_cpes(nvd_item):
-    cpes = []
-    configs = nvd_item.get("cve", {}).get("configurations", {})
-    nodes = configs.get("nodes", [])
+    """
+    Extract all CPE 'criteria' strings from an NVD 2.0 CVE item.
+    Handles configurations as a list (NVD 2.0) and falls back
+    gracefully if it is a dict.
+    """
+    cpes = set()
 
-    for node in nodes:
-        matches = node.get("cpeMatch", [])
-        for m in matches:
-            crit = m.get("criteria")
-            if isinstance(crit, str) and crit not in cpes:
-                cpes.append(crit)
-
-        for child in node.get("children", []):
-            for m in child.get("cpeMatch", []):
+    def walk_nodes(nodes):
+        for node in nodes or []:
+            # Direct cpeMatch entries
+            for m in node.get("cpeMatch", []):
                 crit = m.get("criteria")
-                if isinstance(crit, str) and crit not in cpes:
-                    cpes.append(crit)
-    
-    return cpes
+                if isinstance(crit, str):
+                    cpes.add(crit)
+
+            # Recurse into children if present
+            children = node.get("children") or []
+            if children:
+                walk_nodes(children)
+
+    configs = nvd_item.get("cve", {}).get("configurations", [])
+
+    # NVD 2.0: configurations is typically a list; but be defensive.
+    if isinstance(configs, dict):
+        configs = [configs]
+
+    if isinstance(configs, list):
+        for conf in configs:
+            if not isinstance(conf, dict):
+                continue
+            nodes = conf.get("nodes", [])
+            walk_nodes(nodes)
+
+    return list(cpes)
+
+def nvd_extract_vendors_products(nvd_item):
+    """
+    Use CPEs from configurations to derive sets of vendors and products.
+    """
+    cpes = nvd_extract_cpes(nvd_item)
+    vendors = set()
+    products = set()
+
+    for crit in cpes:
+        parsed = parse_cpe(crit)
+        if not parsed:
+            continue
+        vendors.add(parsed["vendor"])
+        products.add(parsed["product"])
+
+    # Return sorted lists for nicer output
+    return sorted(vendors), sorted(products)
+
+def parse_cpe(criteria):
+    """
+    Parse a CPE 2.3 URI like:
+      cpe:2.3:a:vendor:product:version:...
+    and return a dict with vendor/product/etc.
+    """
+    if not isinstance(criteria, str):
+        return None
+
+    parts = criteria.split(":")
+
+    # Basic sanity check for CPE 2.3
+    if len(parts) < 5:
+        return None
+    if parts[0] != "cpe" or parts[1] not in ("2.3", "2.2"):
+        return None
+
+    return {
+        "part": parts[2],                 # a = application, o = OS, h = hardware
+        "vendor": parts[3],
+        "product": parts[4],
+        "version": parts[5] if len(parts) > 5 else "*",
+    }
 
 def format_table(rows):
     if not rows:
@@ -250,12 +310,20 @@ def main():
     if not cve_ids:
         print("No CVE IDs could be extracted from source:", source)
         sys.exit(0)
-    
+
     api_key = os.getenv("NVD_API_KEY")
-    print(f"NVD API Key: {api_key}")
 
     results = []
     for idx, cve_id in enumerate(cve_ids):
+        # Remove old CVEs that just got recently updated
+        if args.min_year:
+            try:
+                year = int(cve_id.split("-")[1])
+                if year < args.min_year:
+                    continue
+            except (IndexError, ValueError):
+                pass
+
         nvd_item = nvd_get_cve(cve_id, api_key, verbose)
         if not nvd_item:
             continue
@@ -270,9 +338,19 @@ def main():
         descriptions = cve_core.get("descriptions", [])
         summary = ""
 
+        vendors, products = nvd_extract_vendors_products(nvd_item)
+
         if isinstance(descriptions, list) and descriptions:
             en = next((d for d in descriptions if d.get("lang") == "en"), descriptions[0])
             summary = en.get("value", "")[:300]
+
+        if args.tech:
+            needle = args.tech.lower()
+            haystack = (
+                " ".join(cpes + vendors + products + [summary])
+            ).lower()
+            if needle not in haystack:
+                continue
 
         results.append({
             "cve": cve_id,
@@ -283,6 +361,8 @@ def main():
             "cpe_count": len(cpes),
             "summary": summary,
             "cpes": cpes,
+            "vendors": vendors,
+            "products": products,
         })
 
         if idx < len(cve_ids) - 1:
@@ -296,15 +376,31 @@ def main():
     if not args.no_save:
         csv_path = "cves.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["cve","cvss","severity","vector","published","cpe_count","summary","cpes"])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "cve",
+                    "cvss",
+                    "severity",
+                    "vector",
+                    "published",
+                    "cpe_count",
+                    "summary",
+                    "cpes",
+                    "vendors",
+                    "products",
+                ],
+            )
             writer.writeheader()
             for r in results:
                 r_copy = dict(r)
+                # flatten lists to space-separated strings
                 r_copy["cpes"] = " ".join(r_copy.get("cpes", []))
+                r_copy["vendors"] = " ".join(r_copy.get("vendors", []))
+                r_copy["products"] = " ".join(r_copy.get("products", []))
                 writer.writerow(r_copy)
 
         print(f"\nSaved {len(results)} records to {csv_path}")
-        print("Tip: open with a spreadsheet or parse in your pipeline.")
 
 if __name__ == "__main__":
     main()
