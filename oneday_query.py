@@ -266,14 +266,25 @@ def parse_cpe(criteria):
     }
 
 def push_results_to_oneday(results):
+    api_key = os.environ.get("ONEDAY_API_KEY", "")
+    if not api_key:
+        print("[!] Warning: ONEDAY_API_KEY not set. Server may reject the request.", file=sys.stderr)
+
     payload = {
         "source": "oneday_query_runner",
         "sent_at": dt.datetime.utcnow().isoformat() + "Z",
         "vulnerabilities": results,
     }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": api_key,
+    }
+
     r = requests.post(
         "https://oneday.darkage.io/vulns",
         json=payload,
+        headers=headers,
         timeout=10,
     )
     r.raise_for_status()

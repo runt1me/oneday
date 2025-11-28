@@ -1,2 +1,9 @@
 ﻿*.csv
 nvd_api_key.txt
+
+# Server files
+server/.env
+server/data/
+*.db
+__pycache__/
+*.pyc
