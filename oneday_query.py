@@ -285,9 +285,23 @@ def push_results_to_oneday(results):
         "https://oneday.darkage.io/vulns",
         json=payload,
         headers=headers,
-        timeout=10,
+        timeout=30,
     )
     r.raise_for_status()
+
+    # Parse and display response details
+    resp = r.json()
+    print(f"[*] Server response: received={resp.get('received', 0)}, "
+          f"inserted={resp.get('inserted', 0)}, updated={resp.get('updated', 0)}")
+
+    # Show any errors from the server
+    errors = resp.get("errors", [])
+    if errors:
+        print(f"[!] Server reported {len(errors)} error(s):", file=sys.stderr)
+        for err in errors[:10]:  # Show first 10 errors
+            print(f"    - {err}", file=sys.stderr)
+        if len(errors) > 10:
+            print(f"    ... and {len(errors) - 10} more", file=sys.stderr)
 
 def format_table(rows):
     if not rows:
@@ -369,7 +383,7 @@ def main():
 
         if isinstance(descriptions, list) and descriptions:
             en = next((d for d in descriptions if d.get("lang") == "en"), descriptions[0])
-            summary = en.get("value", "")[:300]
+            summary = en.get("value", "")
 
         if args.tech:
             needle = args.tech.lower()
